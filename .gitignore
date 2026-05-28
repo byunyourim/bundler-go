@@ -1,0 +1,18 @@
+# 빌드 산출물
+/bin/
+/dist/
+
+# 환경/시크릿 (키 절대 커밋 금지)
+.env
+*.local
+*.key
+keys.db
+
+# Go
+*.test
+*.out
+coverage.*
+
+# IDE
+.idea/
+.vscode/
