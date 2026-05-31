@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"strconv"
 	"sync"
 	"time"
 
@@ -21,15 +22,22 @@ const (
 
 // Batcher 는 체인별 핫월렛 풀 위에서 UserOp를 묶어 handleOps로 제출한다.
 //
-// 멀티번들러 모델: 체인마다 풀 크기 N개의 워커 고루틴을 띄운다(월렛당 1개).
-// 워커는 공유 채널에서 그리디하게 op를 모아 자기 월렛으로 handleOps를 보낸다.
-// 서로 다른 월렛은 nonce 락이 독립이라 동시 제출 → 체인당 동시 in-flight tx N개.
-// 부하 분산(라운드로빈)은 "먼저 비는 워커가 다음 배치를 집는" 방식으로 자연 발생한다.
+// 멀티번들러 모델: 체인마다 디스패처 1개가 채널에서 op를 그리디하게 모아 배치를 만들고,
+// redis 라운드로빈 커서(Locker.NextIndex)로 풀에서 핫월렛을 골라 그 월렛으로 handleOps를
+// 보낸다. 동시 flush는 풀 크기만큼 허용(semaphore)하며, 서로 다른 월렛은 nonce 락이 독립이라
+// 동시 제출된다 → 체인당 동시 in-flight tx N개. 라운드로빈 커서는 redis에 있어 멀티프로세스에서도
+// 전역적으로 부하가 분산된다(redis 미설정 시 프로세스 내 카운터로 폴백).
 type Batcher struct {
 	deps *core.Deps
 
-	mu    sync.Mutex
-	chans map[int64]chan *queuedOp
+	mu     sync.Mutex
+	chains map[int64]*chainQueue
+}
+
+type chainQueue struct {
+	ch   chan *queuedOp
+	pool []*signer.Account
+	sem  chan struct{} // 동시 flush 상한 = 풀 크기
 }
 
 type queuedOp struct {
@@ -44,18 +52,18 @@ type opResult struct {
 
 // NewBatcher 생성.
 func NewBatcher(deps *core.Deps) *Batcher {
-	return &Batcher{deps: deps, chans: make(map[int64]chan *queuedOp)}
+	return &Batcher{deps: deps, chains: make(map[int64]*chainQueue)}
 }
 
 // Enqueue 는 op를 체인 큐에 넣고 제출 결과(txHash)를 기다린다.
 func (b *Batcher) Enqueue(ctx context.Context, chainID int64, op PackedUserOp) (string, error) {
-	ch, err := b.chanFor(ctx, chainID)
+	cq, err := b.queueFor(ctx, chainID)
 	if err != nil {
 		return "", err
 	}
 	q := &queuedOp{op: op, res: make(chan opResult, 1)}
 	select {
-	case ch <- q:
+	case cq.ch <- q:
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
@@ -67,42 +75,62 @@ func (b *Batcher) Enqueue(ctx context.Context, chainID int64, op PackedUserOp) (
 	}
 }
 
-// chanFor 는 체인 큐 채널을 반환한다(없으면 풀 크기만큼 워커 시작).
-func (b *Batcher) chanFor(ctx context.Context, chainID int64) (chan *queuedOp, error) {
+// queueFor 는 체인 큐를 반환한다(없으면 풀 로드 + 디스패처 시작).
+func (b *Batcher) queueFor(ctx context.Context, chainID int64) (*chainQueue, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if ch, ok := b.chans[chainID]; ok {
-		return ch, nil
+	if cq, ok := b.chains[chainID]; ok {
+		return cq, nil
 	}
 	pool, err := b.deps.Signers.BundlerPool(ctx, chainID)
 	if err != nil {
 		return nil, err
 	}
-	ch := make(chan *queuedOp, maxBatchSize*2)
-	for _, wallet := range pool {
-		go b.worker(chainID, wallet, ch)
+	cq := &chainQueue{
+		ch:   make(chan *queuedOp, maxBatchSize*2),
+		pool: pool,
+		sem:  make(chan struct{}, len(pool)),
 	}
-	b.chans[chainID] = ch
+	b.chains[chainID] = cq
+	go b.dispatch(chainID, cq)
 	b.deps.Log.Info("bundler pool started", "chainId", chainID, "wallets", len(pool))
-	return ch, nil
+	return cq, nil
 }
 
-// worker 는 한 핫월렛으로 채널에서 op를 그리디하게 모아 배치 제출한다.
-func (b *Batcher) worker(chainID int64, wallet *signer.Account, ch chan *queuedOp) {
-	for first := range ch {
+// dispatch 는 채널에서 배치를 모아 라운드로빈으로 월렛을 골라 flush를 띄운다.
+func (b *Batcher) dispatch(chainID int64, cq *chainQueue) {
+	cursorKey := strconv.FormatInt(chainID, 10)
+	for first := range cq.ch {
 		batch := []*queuedOp{first}
-		// 현재 채널에 쌓인 op를 블로킹 없이 추가 수집(최대 maxBatchSize).
 	drain:
 		for len(batch) < maxBatchSize {
 			select {
-			case q := <-ch:
+			case q := <-cq.ch:
 				batch = append(batch, q)
 			default:
 				break drain
 			}
 		}
-		b.flush(chainID, wallet, batch)
+
+		wallet := cq.pool[b.nextIndex(cursorKey, len(cq.pool))]
+		cq.sem <- struct{}{} // 동시 flush 상한
+		go func(w *signer.Account, ops []*queuedOp) {
+			defer func() { <-cq.sem }()
+			b.flush(chainID, w, ops)
+		}(wallet, batch)
 	}
+}
+
+// nextIndex 는 redis 라운드로빈 커서로 풀 인덱스를 고른다(실패 시 0).
+func (b *Batcher) nextIndex(cursorKey string, n int) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	idx, err := b.deps.Locker.NextIndex(ctx, cursorKey, n)
+	if err != nil {
+		b.deps.Log.Warn("round-robin cursor failed, using wallet 0", "err", err)
+		return 0
+	}
+	return idx
 }
 
 // flush 는 배치를 1개 handleOps로 보내고, 실패 시 1건 이상이면 개별 재시도한다.(TS drain 대응)

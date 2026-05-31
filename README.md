@@ -45,10 +45,12 @@ internal/
 프로세스 메모리에 들고 있어 **멀티프로세스에서 nonce가 충돌**했다. Go 버전은 두 축으로 개선한다.
 
 - **체인별 핫월렛 풀** — `bundler_key_<chainId>_0..N` 키를 풀로 로드(`internal/signer`).
-  `userop` 배치 큐는 체인당 풀 크기 N개의 워커(월렛당 1개)를 띄우고, 워커가 공유 채널에서
-  op를 그리디하게 모아 자기 월렛으로 `handleOps`를 보낸다. 서로 다른 월렛은 nonce 락이
-  독립이라 **체인당 동시 in-flight tx N개** → 단일 EOA의 nonce 직렬화 병목 제거.
-  핫월렛 1개(또는 `OWNER_KEY`/`owner_key`)면 풀 크기 1로 기존 TS와 동일하게 동작.
+  `userop` 배치 큐는 체인당 디스패처 1개가 채널에서 op를 그리디하게 모아 배치를 만들고,
+  **redis 라운드로빈 커서**(`Locker.NextIndex` = `INCR walletcursor:{chainId} % N`)로 풀에서
+  월렛을 골라 `handleOps`를 보낸다. 동시 flush는 풀 크기만큼 허용(semaphore)하고, 서로 다른
+  월렛은 nonce 락이 독립이라 **체인당 동시 in-flight tx N개** → 단일 EOA의 nonce 직렬화 병목
+  제거. 커서가 redis에 있어 멀티프로세스에서도 부하가 전역 분산된다(redis 미설정 시 프로세스
+  내 카운터로 폴백). 핫월렛 1개(또는 `OWNER_KEY`/`owner_key`)면 풀 크기 1로 기존 TS와 동일.
 
 - **멀티프로세스 안전 nonce** — nonce는 캐시하지 않고 `WithNonceLock(nonce:{chainId}:{wallet})`
   안에서 매번 온체인 `PendingNonceAt`를 읽는다. redis 락이 월렛별 nonce 줄을 전역 단일
