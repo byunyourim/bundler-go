@@ -35,10 +35,10 @@ const (
 
 // Normalized 는 정규화된 실패 정보. JSON 키는 TS tx-error.ts 응답과 동일.
 type Normalized struct {
-	Status     int      `json:"-"`             // HTTP status (응답 body엔 미포함)
-	RPCCode    int      `json:"-"`             // 노드 JSON-RPC error code (JSON-RPC 응답용)
+	Status     int      `json:"-"` // HTTP status (응답 body엔 미포함)
+	RPCCode    int      `json:"-"` // 노드 JSON-RPC error code (JSON-RPC 응답용)
 	Category   Category `json:"category"`
-	Code       string   `json:"code"`          // AC007 / BUNDLER_NONCE_CONFLICT / ...
+	Code       string   `json:"code"`                 // AC007 / BUNDLER_NONCE_CONFLICT / ...
 	NativeCode string   `json:"ethersCode,omitempty"` // 계약 유지: go-ethereum 식별자를 ethersCode 자리에
 	Reason     string   `json:"reason,omitempty"`
 	TxHash     string   `json:"txHash,omitempty"`

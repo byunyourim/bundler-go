@@ -21,19 +21,43 @@ internal/
   split/                     # POST /api/eoa-funded-split/... (정산 split)
   userop/                    # POST /api/bundler[/{chainId}]  (ERC-4337 JSON-RPC + batch)
   chain/                     # 체인별 RPC/Factory/EntryPoint 설정
-  evm/                       # CREATE2 주소계산, ABI 헬퍼
+  evm/                       # CREATE2 주소계산, 가스/서명/숫자 헬퍼
+  signer/                    # ★ 멀티번들러 핫월렛 풀 + server_key1/2 (아래 참고)
+  core/                      # 도메인 공용 의존성(Deps) + 관리 tx 헬퍼
 
   # ── 플랫폼 ──
   platform/
     txerror/                 # ★ 트랜잭션/RPC 실패 정밀 분류 (아래 참고)
     httpx/                   # 구조화 에러 응답 헬퍼
-    ethclient/               # 체인별 go-ethereum provider/signer
-    redis/                   # nonce 분산락
-    kms/                     # 서명 키 관리 (개인키 평문 금지)
+    ethclient/               # 체인별 go-ethereum client 캐시
+    redis/                   # nonce 분산락 + 라운드로빈 커서
+    kms/                     # 암호화 keystore(SQLite) + NHN KMS 복호화 (개인키 평문 금지)
     env/ logger/
 ```
 
 라우트 매핑은 기존 Next.js `app/api/*`와 1:1.
+
+---
+
+## ★ 멀티번들러 (TS 대비 구조 개선)
+
+기존 TS는 단일 번들러 키(`owner_key`)를 모든 체인에서 공유하고, 배치 큐가 nonce를
+프로세스 메모리에 들고 있어 **멀티프로세스에서 nonce가 충돌**했다. Go 버전은 두 축으로 개선한다.
+
+- **체인별 핫월렛 풀** — `bundler_key_<chainId>_0..N` 키를 풀로 로드(`internal/signer`).
+  `userop` 배치 큐는 체인당 풀 크기 N개의 워커(월렛당 1개)를 띄우고, 워커가 공유 채널에서
+  op를 그리디하게 모아 자기 월렛으로 `handleOps`를 보낸다. 서로 다른 월렛은 nonce 락이
+  독립이라 **체인당 동시 in-flight tx N개** → 단일 EOA의 nonce 직렬화 병목 제거.
+  핫월렛 1개(또는 `OWNER_KEY`/`owner_key`)면 풀 크기 1로 기존 TS와 동일하게 동작.
+
+- **멀티프로세스 안전 nonce** — nonce는 캐시하지 않고 `WithNonceLock(nonce:{chainId}:{wallet})`
+  안에서 매번 온체인 `PendingNonceAt`를 읽는다. redis 락이 월렛별 nonce 줄을 전역 단일
+  직렬화하므로 프로세스를 N개 띄워도 안전. redis 미설정 시 인메모리 락(단일 인스턴스 전용).
+
+- **결정론 작업은 풀 제외** — 배포 주소는 deployer에 의존하므로 `create2 deploy`와
+  `entrypoint deposit/withdraw`는 라운드로빈하지 않고 `PrimaryBundler`(풀 `[0]`, 고정)를 쓴다.
+
+`server_key1`/`server_key2`(2-of-3 공동서명자)와 EOA 직접 전송은 풀 대상이 아니라 단일 키.
 
 ---
 
@@ -70,12 +94,13 @@ internal/
 | 언어 | Go 1.25 | 리스너·어댑터와 통일 |
 | 체인 연동 | go-ethereum (`ethclient`/`abi`/`rpc`/`crypto`) | ethers 대응 |
 | HTTP | 표준 `net/http` (ServeMux, Go 1.22+ 패턴 라우팅) | 경량, 의존 0 |
-| nonce 락/캐시 | redis/go-redis | TS ioredis 대응 |
-| 키 관리 | KMS / 암호화 keystore | 개인키 평문 금지 |
+| nonce 락/커서 | redis/go-redis | TS ioredis 대응 (멀티프로세스 직렬화) |
+| 키 관리 | NHN KMS + 암호화 keystore(SQLite) | 개인키 평문 금지, 핫월렛 풀 |
+| keystore 드라이버 | modernc.org/sqlite | pure-Go (cgo 불필요) |
 | 로깅 | log/slog (pino 포맷) | ELK 인입 유지 (리스너·어댑터와 동일) |
 | 에러 | `platform/txerror` | TS tx-error.ts 계약 이식 |
 
-> DB: 기존 번들러는 keystore용 SQLite만 사용. 키는 KMS로 가는 게 우선이라 범용 DB는 도입하지 않음.
+> DB: keystore용 SQLite만 사용(readonly). 키는 KMS로 가는 게 우선이라 범용 DB는 도입하지 않음.
 
 ---
 
@@ -83,18 +108,15 @@ internal/
 
 ```bash
 brew install go golangci-lint
-go get github.com/ethereum/go-ethereum
-go get github.com/redis/go-redis/v9
-go get github.com/caarlos0/env/v11
-go mod tidy
+go mod tidy   # go-ethereum / go-redis / caarlos0/env / modernc.org/sqlite
 
 cp .env.example .env
 make build && make test
 make run   # :3000
 ```
 
-> 현재 상태: **골격(skeleton)**. `platform/txerror`·`logger`·`httpx`는 구현 완료,
-> 도메인 핸들러와 ethclient/redis/kms는 `panic("not implemented")` / `TODO(골격)`.
+> 현재 상태: **이식 완료**. 전 도메인(userop·transfer·deploy·entrypoint·split) +
+> 멀티번들러 핫월렛 풀(`signer`)·KMS keystore(`kms`)·분산락(`redis`) 구현. `make test` 통과.
 
 ---
 
