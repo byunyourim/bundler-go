@@ -30,9 +30,16 @@ const (
 type Batcher struct {
 	deps *core.Deps
 
+	// submit 은 락 안에서 실제 체인 제출(nonce 조회 + handleOps + 채굴 대기)을 수행한다.
+	// 기본값은 onchainSubmit. 테스트에서 체인 I/O를 페이크로 주입하는 seam.
+	submit submitFunc
+
 	mu     sync.Mutex
 	chains map[int64]*chainQueue
 }
+
+// submitFunc 는 락 보유 상태에서 ops를 wallet으로 제출하고 txHash를 반환한다.
+type submitFunc func(ctx context.Context, chainID int64, wallet *signer.Account, ops []PackedUserOp) (string, error)
 
 type chainQueue struct {
 	ch   chan *queuedOp
@@ -52,7 +59,9 @@ type opResult struct {
 
 // NewBatcher 생성.
 func NewBatcher(deps *core.Deps) *Batcher {
-	return &Batcher{deps: deps, chains: make(map[int64]*chainQueue)}
+	b := &Batcher{deps: deps, chains: make(map[int64]*chainQueue)}
+	b.submit = b.onchainSubmit
+	return b
 }
 
 // Enqueue 는 op를 체인 큐에 넣고 제출 결과(txHash)를 기다린다.
@@ -162,7 +171,8 @@ func (b *Batcher) flush(chainID int64, wallet *signer.Account, batch []*queuedOp
 	batch[0].res <- opResult{err: err}
 }
 
-// sendUnderLock 은 월렛 nonce 락 안에서 온체인 pending nonce를 읽어 handleOps를 보내고 채굴을 기다린다.
+// sendUnderLock 은 월렛 nonce 락을 잡고 submit(기본 onchainSubmit)을 실행한다.
+// 락이 월렛별 nonce 줄을 전역 단일 직렬화한다(멀티프로세스 안전).
 func (b *Batcher) sendUnderLock(chainID int64, wallet *signer.Account, ops []PackedUserOp) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), txWaitTimeout+15*time.Second)
 	defer cancel()
@@ -170,45 +180,49 @@ func (b *Batcher) sendUnderLock(chainID int64, wallet *signer.Account, ops []Pac
 	lockKey := core.NonceLockKey(chainID, wallet.Address().Hex())
 	var txHash string
 	err := b.deps.Locker.WithNonceLock(ctx, lockKey, func() error {
-		client, err := b.deps.Clients.Client(ctx, chainID)
-		if err != nil {
-			return err
-		}
-		epAddr, err := b.deps.Reg.EntryPoint()
-		if err != nil {
-			return err
-		}
-
-		// 멀티프로세스 안전: nonce는 캐시하지 않고 매번 온체인 pending을 읽는다.
-		nonce, err := client.PendingNonceAt(ctx, wallet.Address())
-		if err != nil {
-			return err
-		}
-
-		opts, err := wallet.Transactor(big.NewInt(chainID))
-		if err != nil {
-			return err
-		}
-		opts.Context = ctx
-		opts.Nonce = new(big.Int).SetUint64(nonce)
-
-		bc := bind.NewBoundContract(common.HexToAddress(epAddr), EntryPointABI(), client, client, client)
-		// beneficiary=ZeroAddress → EntryPoint가 msg.sender(번들러)를 수령인으로 사용.
-		tx, err := bc.Transact(opts, "handleOps", ops, common.Address{})
-		if err != nil {
-			return err
-		}
-		txHash = tx.Hash().Hex()
-
-		waitCtx, waitCancel := context.WithTimeout(ctx, txWaitTimeout)
-		defer waitCancel()
-		if _, err := bind.WaitMined(waitCtx, client, tx); err != nil {
-			return fmt.Errorf("tx.wait (txHash %s): %w", txHash, err)
-		}
-		return nil
+		h, err := b.submit(ctx, chainID, wallet, ops)
+		txHash = h
+		return err
 	})
+	return txHash, err
+}
+
+// onchainSubmit 은 온체인 pending nonce를 읽어 handleOps를 보내고 채굴을 기다린다.
+func (b *Batcher) onchainSubmit(ctx context.Context, chainID int64, wallet *signer.Account, ops []PackedUserOp) (string, error) {
+	client, err := b.deps.Clients.Client(ctx, chainID)
 	if err != nil {
-		return txHash, err
+		return "", err
+	}
+	epAddr, err := b.deps.Reg.EntryPoint()
+	if err != nil {
+		return "", err
+	}
+
+	// 멀티프로세스 안전: nonce는 캐시하지 않고 매번 온체인 pending을 읽는다.
+	nonce, err := client.PendingNonceAt(ctx, wallet.Address())
+	if err != nil {
+		return "", err
+	}
+
+	opts, err := wallet.Transactor(big.NewInt(chainID))
+	if err != nil {
+		return "", err
+	}
+	opts.Context = ctx
+	opts.Nonce = new(big.Int).SetUint64(nonce)
+
+	bc := bind.NewBoundContract(common.HexToAddress(epAddr), EntryPointABI(), client, client, client)
+	// beneficiary=ZeroAddress → EntryPoint가 msg.sender(번들러)를 수령인으로 사용.
+	tx, err := bc.Transact(opts, "handleOps", ops, common.Address{})
+	if err != nil {
+		return "", err
+	}
+	txHash := tx.Hash().Hex()
+
+	waitCtx, waitCancel := context.WithTimeout(ctx, txWaitTimeout)
+	defer waitCancel()
+	if _, err := bind.WaitMined(waitCtx, client, tx); err != nil {
+		return txHash, fmt.Errorf("tx.wait (txHash %s): %w", txHash, err)
 	}
 	return txHash, nil
 }
