@@ -4,6 +4,8 @@ ERC-4337 번들러 + 트랜잭션 실행 서비스. CREATE2 지갑 배포, nativ
 EntryPoint 가스풀 관리, EOA-funded-split 정산, UserOperation 번들링을 REST/JSON-RPC로 제공한다.
 기존 Next.js(TypeScript) 번들러를 Go로 재작성한 프로젝트.
 
+> 📊 컴포넌트 구조·시퀀스 다이어그램·전체 흐름은 [ARCHITECTURE.md](./ARCHITECTURE.md) 참고 (mermaid).
+
 ---
 
 ## 아키텍처: 도메인별 납작 패키지 (리스너·어댑터와 동일)
